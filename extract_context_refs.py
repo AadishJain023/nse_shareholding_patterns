@@ -91,7 +91,7 @@ def extract_all_context_refs(csv_path, output_file="unique_context_refs.txt", ma
 
 
 if __name__ == "__main__":
-    csv_path = "nse_xbr_data_sample.csv"
+    csv_path = "nse_xbr_data.csv"
     output_file = "unique_context_refs.txt"
     
     # Extract context_refs

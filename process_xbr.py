@@ -174,7 +174,7 @@ def process_nse_xbr_data(csv_path, output_path=None, context_refs_output=None, l
 
 if __name__ == "__main__":
     # Path to the CSV file
-    csv_path = "nse_xbr_data_sample.csv"
+    csv_path = "nse_xbr_data.csv"
     
     # Output paths
     output_path = "shareholding_extracted.csv"
