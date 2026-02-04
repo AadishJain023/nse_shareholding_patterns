@@ -1,131 +1,114 @@
-import requests
+import asyncio
+import aiohttp
 import pandas as pd
 from lxml import etree
-import urllib3
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 import random
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import time
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ---------------- CONFIG ----------------
+MAX_CONCURRENCY = 15      # tune: 10–25 is usually safe
+REQUEST_TIMEOUT = 60
+RETRIES = 3
 
-CSV_PATH = "sample.csv"
-FINAL_OUTPUT = "final.csv"
-MAX_WORKERS = 5
-
-# ─────────────────────────────────────────────
-# CATEGORY → FIELD NAME
-# ─────────────────────────────────────────────
-FIELD_MAP = {
-    "perf_FPI": "perc_FPI",
-    "perf_bank": "perc_bank",
-    "perf_insur": "perc_insur",
-    "perf_mf": "perc_mf",
-    "perf_public": "perc_public",
-    "perf_promoter": "perc_promoters",
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/xml, text/xml, */*"
 }
-
-# ─────────────────────────────────────────────
-def get_session():
-    session = requests.Session()
-    retry = Retry(
-        total=5,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=10,
-        pool_maxsize=10
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+# ----------------------------------------
 
 
-# ─────────────────────────────────────────────
-def fetch_xbrl(xbrl_url, category_contexts):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/xml, text/xml, */*',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive'
-    }
-    try:
-        session = get_session()
-        r = session.get(xbrl_url, headers = headers,timeout=60, verify=False)
-        r.raise_for_status()
-
-        root = etree.fromstring(r.content)
-
-        totals = {k: 0.0 for k in category_contexts}
-
-        nodes = root.xpath(
-            "//*[local-name()='ShareholdingAsAPercentageOfTotalNumberOfShares']"
-        )
-
-        for n in nodes:
-            ctx = n.attrib.get("contextRef")
-            if not ctx or not n.text:
-                continue
-
+async def fetch_xbrl(session, semaphore, symbol, xbrl_url, category_contexts):
+    async with semaphore:
+        for attempt in range(RETRIES):
             try:
-                val = float(n.text)
-            except:
-                continue
+                async with session.get(xbrl_url, timeout=REQUEST_TIMEOUT) as resp:
+                    resp.raise_for_status()
+                    xml = await resp.read()
 
-            for cat, ctx_set in category_contexts.items():
-                if ctx in ctx_set:
-                    totals[cat] += val
+                root = etree.fromstring(xml)
 
-        return totals
-    except Exception as e:
-            raise Exception(f"Error fetching from {xbrl_url} : {type(e).__name__}: {str(e)}")
+                totals = {cat: 0.0 for cat in category_contexts}
 
+                # single XPath scan
+                for n in root.xpath(
+                    "//*[local-name()='ShareholdingAsAPercentageOfTotalNumberOfShares']"
+                ):
+                    ctx = n.attrib.get("contextRef")
+                    if not ctx or not n.text:
+                        continue
 
-# ─────────────────────────────────────────────
-def process_stock(args):
-    idx, row, category_contexts = args
-    symbol = row["symbol"]
+                    val = float(n.text)
 
-    time.sleep(random.uniform(0.4, 1.2))
+                    for cat, ctx_set in category_contexts.items():
+                        if ctx in ctx_set:
+                            totals[cat] += val
 
-    try:
-        data = fetch_xbrl(row["xbrl"], category_contexts)
+                return {
+                    "symbol": symbol,
+                    "status": "success",
+                    **totals
+                }
 
-        non_zero = sum(1 for v in data.values() if v > 0)
-        print(f"✓ {symbol}: {non_zero} categories")
-
-        return {
-            "symbol": symbol,
-            "date": row["date"],
-            "broadcastDate": row["broadcastDate"],
-            "pr_and_prgrp" : row["pr_and_prgrp"],
-            "public_val" : row["public_val"],
-            "status": "success",
-            "data": data
-        }
-
-    except Exception as e:
-        print(f"✗ {symbol}: {type(e).__name__}")
-        return {
-            "symbol": symbol,
-            "date": row["date"],
-            "broadcastDate": row["broadcastDate"],
-            "status": "error",
-            "error": str(e),
-            "pr_and_prgrp" : row["pr_and_prgrp"],
-            "public_val" : row["public_val"],
-            "data": {}
-        }
+            except Exception as e:
+                if attempt == RETRIES - 1:
+                    return {
+                        "symbol": symbol,
+                        "status": "error",
+                        "error": str(e)
+                    }
+                await asyncio.sleep(2 ** attempt + random.random())
 
 
-# ─────────────────────────────────────────────
+async def run_async(csv_path, category_contexts, output_file=None, limit=None):
+    df = pd.read_csv(csv_path)
+    if limit:
+        df = df.head(limit)
+
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY, ssl=False)
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers=HEADERS
+    ) as session:
+
+        tasks = [
+            fetch_xbrl(
+                session,
+                semaphore,
+                row["symbol"],
+                row["xbrl"],
+                category_contexts
+            )
+            for _, row in df.iterrows()
+        ]
+
+        results = []
+        completed = 0
+
+        for coro in asyncio.as_completed(tasks):
+            res = await coro
+            results.append(res)
+            completed += 1
+            if completed % 50 == 0:
+                print(f"[Progress] {completed}/{len(tasks)} done")
+
+    result_df = pd.DataFrame(results)
+
+    if output_file:
+        result_df.to_csv(output_file, index=False)
+        print(f"\nSaved → {output_file}")
+
+    return result_df
+
+
+# ---------------- RUN ----------------
 if __name__ == "__main__":
+    csv_path = "nse_xbr_data.csv"
+    output_file = "shareholding_data_by_context_refs.csv"
 
-     
+
     perf_bank = [
         "DetailsOfSharesHeldByBanks001I",
         "DetailsOfSharesHeldByBanks002I",
@@ -387,47 +370,15 @@ if __name__ == "__main__":
         "perf_insur": set(perf_insur),
     }
 
-    df = pd.read_csv(CSV_PATH)
 
-    tasks = [(i, r, CATEGORY_CONTEXTS) for i, r in df.iterrows()]
-    results = []
-    total = len(tasks)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(process_stock, t) for t in tasks]
-
-        for i, f in enumerate(as_completed(futures), 1):
-            results.append(f.result())
-
-            if i % 50 == 0 or i == total:
-                print(f"[Progress] Completed {i}/{total}")
-
-    # ─────────────────────────────────────────
-    # LONG FORMAT OUTPUT
-    # ─────────────────────────────────────────
-    rows = []
-
-    for r in results:
-        if r["status"] != "success":
-            continue
-
-        first = True
-
-        for cat, field_name in FIELD_MAP.items():
-            rows.append({
-                "Date_ReportingPeriod": r["date"],
-                "Date_DataAvailability": r["broadcastDate"],
-                "Symbol_AsOfReportingDate": r["symbol"],
-                "Field": field_name,
-                "Value": r["data"].get(cat, 0.0),
-                "pr_and_prgrp" : r["pr_and_prgrp"] if first else None,
-                "public_val" : r["public_val"] if first else None
-            })
-            first = False
-            
-
-    final_df = pd.DataFrame(rows)
-    final_df.to_csv(FINAL_OUTPUT, index=False)
-
-    print(f"\n✅ Final long-format file saved → {FINAL_OUTPUT}")
-    print(final_df.head(10))
+    start = time.time()
+    df = asyncio.run(
+        run_async(
+            csv_path,
+            CATEGORY_CONTEXTS,
+            output_file=output_file
+        )
+    )
+    print("\nSample output:")
+    print(df.head())
+    print(f"\nTotal time: {time.time() - start:.2f}s")
