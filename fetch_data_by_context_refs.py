@@ -1,193 +1,114 @@
-"""
-Fetch shareholding data points from XBRL files using specific context_refs
-Groups and extracts data for specified context references
-"""
-
-import requests
+import asyncio
+import aiohttp
 import pandas as pd
 from lxml import etree
-import urllib3
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 import random
+import time
 
-# Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ---------------- CONFIG ----------------
+MAX_CONCURRENCY = 15      # tune: 10–25 is usually safe
+REQUEST_TIMEOUT = 60
+RETRIES = 3
 
-def get_session_with_retries():
-    """Create a session with connection pooling and retry strategy"""
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-    
-    session = requests.Session()
-    
-    retry_strategy = Retry(
-        total=5,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=10,
-        pool_maxsize=10
-    )
-    
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    
-    return session
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/xml, text/xml, */*"
+}
+# ----------------------------------------
 
 
-def fetch_data_from_xbrl(xbrl_url, category_contexts):
-    """
-    Fetch shareholding data from XBRL file for specific context_refs
-    
-    Args:
-        xbrl_url (str): URL to XBRL file
-        context_refs (list): List of context_refs to extract data for
-        
-    Returns:
-        dict: Data for each context_ref
-    """
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'application/xml, text/xml, */*',
-        'Accept-Encoding': 'gzip, deflate',
-        'Connection': 'keep-alive'
-    }
-    
-    try:
-        session = get_session_with_retries()
-        response = session.get(xbrl_url, headers=headers, timeout=60, verify=False)
-        response.raise_for_status()
-        
-        xml = response.content
-        root = etree.fromstring(xml)
-        
-        totals = {cat: 0.0 for cat in category_contexts} 
-        
-        for n in root.xpath("//*[local-name()='ShareholdingAsAPercentageOfTotalNumberOfShares']"):
-            ctx = n.attrib.get("contextRef")
-            if not ctx or not n.text:
-                continue
+async def fetch_xbrl(session, semaphore, symbol, xbrl_url, category_contexts):
+    async with semaphore:
+        for attempt in range(RETRIES):
+            try:
+                async with session.get(xbrl_url, timeout=REQUEST_TIMEOUT) as resp:
+                    resp.raise_for_status()
+                    xml = await resp.read()
 
-            val = float(n.text)
+                root = etree.fromstring(xml)
 
-            for cat, ctx_set in category_contexts.items():
-                if ctx in ctx_set:
-                    totals[cat] += val
+                totals = {cat: 0.0 for cat in category_contexts}
 
-        return totals
-    
-    except Exception as e:
-        raise Exception(f"Error fetching from {xbrl_url}: {type(e).__name__}: {str(e)}")
+                # single XPath scan
+                for n in root.xpath(
+                    "//*[local-name()='ShareholdingAsAPercentageOfTotalNumberOfShares']"
+                ):
+                    ctx = n.attrib.get("contextRef")
+                    if not ctx or not n.text:
+                        continue
+
+                    val = float(n.text)
+
+                    for cat, ctx_set in category_contexts.items():
+                        if ctx in ctx_set:
+                            totals[cat] += val
+
+                return {
+                    "symbol": symbol,
+                    "status": "success",
+                    **totals
+                }
+
+            except Exception as e:
+                if attempt == RETRIES - 1:
+                    return {
+                        "symbol": symbol,
+                        "status": "error",
+                        "error": str(e)
+                    }
+                await asyncio.sleep(2 ** attempt + random.random())
 
 
-def process_stock_for_context_refs(args):
-    """
-    Process a single stock for specific context_refs
-    """
-    idx, row, category_contexts = args
-    symbol = row['symbol']
-    xbrl_url = row['xbrl']
-    
-    # Add random delay
-    time.sleep(random.uniform(0.5, 1.5))
-    
-    try:
-        data = fetch_data_from_xbrl(xbrl_url, category_contexts)
-        result = {
-            'symbol': symbol,
-            'status': 'success',
-            'data': data
-        }
-        print(f"✓ {symbol}: {len(data)} data points found")
-        return result
-        
-    except Exception as e:
-        print(f"✗ {symbol}: {type(e).__name__}")
-        result = {
-            'symbol': symbol,
-            'status': 'error',
-            'error': str(e),
-            'data': {}
-        }
-        return result
-
-
-def fetch_data_by_context_refs(csv_path, context_refs, output_file=None, max_workers=5, limit=None):
-    """
-    Fetch shareholding data for specific context_refs from all stocks
-    
-    Args:
-        csv_path (str): Path to NSE XBR data CSV
-        context_refs (list): List of context_refs to extract
-        output_file (str): File to save results (CSV)
-        max_workers (int): Number of threads
-        limit (int): Limit records for testing
-        
-    Returns:
-        DataFrame: Data for all stocks and specified context_refs
-    """
-    
-    # Read CSV
+async def run_async(csv_path, category_contexts, output_file=None, limit=None):
     df = pd.read_csv(csv_path)
     if limit:
         df = df.head(limit)
-    
-    print(f"Fetching {len(context_refs)} context_refs from {len(df)} stocks with {max_workers} threads...\n")
-    print(f"Context_refs: {context_refs}\n")
-    
-    # Create tasks
-    tasks = [(idx, row, context_refs) for idx, row in df.iterrows()]
-    
-    all_results = []
-    
-    # Process with ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_stock_for_context_refs, task) for task in tasks]
-        
+
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY, ssl=False)
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        headers=HEADERS
+    ) as session:
+
+        tasks = [
+            fetch_xbrl(
+                session,
+                semaphore,
+                row["symbol"],
+                row["xbrl"],
+                category_contexts
+            )
+            for _, row in df.iterrows()
+        ]
+
+        results = []
         completed = 0
-        for future in as_completed(futures):
-            try:
-                result = future.result()
-                all_results.append(result)
-                completed += 1
-                if completed % 50 == 0:
-                    print(f"[Progress] Completed {completed}/{len(tasks)}")
-            except Exception as e:
-                print(f"Error: {str(e)}")
-    
-    print(f"\nFinished!")
-    
-    # Create DataFrame
-    result_data = []
-    for result in all_results:
-        row = {'symbol': result['symbol'], 'status': result['status']}
-        if result['status'] == 'success':
-            row.update(result['data'])
-        else:
-            row['error'] = result.get('error', '')
-        result_data.append(row)
-    
-    result_df = pd.DataFrame(result_data)
-    
-    # Save if output file specified
+
+        for coro in asyncio.as_completed(tasks):
+            res = await coro
+            results.append(res)
+            completed += 1
+            if completed % 50 == 0:
+                print(f"[Progress] {completed}/{len(tasks)} done")
+
+    result_df = pd.DataFrame(results)
+
     if output_file:
         result_df.to_csv(output_file, index=False)
-        print(f"Data saved to {output_file}")
-    
+        print(f"\nSaved → {output_file}")
+
     return result_df
 
 
-
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     csv_path = "nse_xbr_data.csv"
     output_file = "shareholding_data_by_context_refs.csv"
-  
+
+
     perf_bank = [
         "DetailsOfSharesHeldByBanks001I",
         "DetailsOfSharesHeldByBanks002I",
@@ -448,41 +369,15 @@ if __name__ == "__main__":
         "perf_insur": set(perf_insur),
     }
 
-    df = pd.read_csv(csv_path)
 
-    tasks = [
-        (idx, row, CATEGORY_CONTEXTS)
-        for idx, row in df.iterrows()
-    ]
-
-    results = []
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = [executor.submit(process_stock_for_context_refs, t) for t in tasks]
-
-        for i, f in enumerate(as_completed(futures), 1):
-            res = f.result()
-            results.append(res)
-            if i % 50 == 0:
-                print(f"[Progress] {i}/{len(tasks)} done")
-
-    # Flatten results
-    rows = []
-    for r in results:
-        base = {
-            "symbol": r["symbol"],
-            "status": r["status"]
-        }
-        if r["status"] == "success":
-            base.update(r["data"])
-        else:
-            base["error"] = r.get("error", "")
-        rows.append(base)
-
-    result_df = pd.DataFrame(rows)
-
-    result_df.to_csv(output_file, index=False)
-    print(f"\nSaved → {output_file}")
-
+    start = time.time()
+    df = asyncio.run(
+        run_async(
+            csv_path,
+            CATEGORY_CONTEXTS,
+            output_file=output_file
+        )
+    )
     print("\nSample output:")
-    print(result_df.head())
+    print(df.head())
+    print(f"\nTotal time: {time.time() - start:.2f}s")
